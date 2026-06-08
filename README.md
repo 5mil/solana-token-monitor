@@ -3,71 +3,70 @@
 Watches a Solana token around the clock and posts to Telegram and X
 when something worth saying happens.
 
-It pulls data from DEXScreener, Birdeye, Solscan, and X every 5 minutes,
-scores the token's health across 5 dimensions, and figures out whether
-anything has changed enough to be worth posting. When it does post,
-it either uses an AI you've configured (Grok, OpenAI, or Nemotron) or
-falls back to data-driven templates.
+This repo contains no pre-configured accounts, tokens, or secrets.
+Everyone who uses it sets up their own Supabase project, their own
+Telegram bot, and their own API keys. Nothing here is tied to anyone.
 
-Everything runs on Supabase — the database, the scheduled function,
-the content queue. No server to maintain.
+It pulls data from DEXScreener, Birdeye, Solscan, and X every 5 minutes,
+scores the token’s health across 5 dimensions, and decides whether anything
+has changed enough to be worth posting. When it posts, it uses whatever
+AI provider you’ve configured — Grok, OpenAI, or Nemotron — or falls
+back to data-driven templates if you’ve set none.
+
+Everything runs on Supabase — the database, the scheduled function, the
+content queue. No server to maintain.
 
 ---
 
 ## what it does
 
 - scores token health 0-100 across liquidity, trading, holders, social, listings
-- detects: new trending entries, volume spikes, price moves, holder milestones, health warnings
-- posts to a public Telegram channel and a private ops group, with different content per channel
+- detects: trending entries, volume spikes, price moves, holder milestones, health warnings
+- posts to a public Telegram channel and a private ops group with different content per channel
 - queues tweets for a lightweight Python poster service
 - logs every metric, decision, and post to Postgres — full audit trail
-- uses Grok, OpenAI, or Nemotron for post copy if you provide a key; templates otherwise
+- uses your preferred AI for post copy, or templates if you prefer none
 
 ---
 
 ## quickstart
 
-Full step-by-step is in [docs/setup.md](docs/setup.md).
+Full guide: [docs/setup.md](docs/setup.md)
 
 Short version:
-
 1. create a Supabase project
-2. run the migration SQL in the Supabase SQL editor
-3. deploy the edge function (`supabase functions deploy mim-monitor --no-verify-jwt`)
+2. run the migration SQL in the SQL editor
+3. deploy the edge function
 4. set your secrets in the Supabase dashboard
-5. run `scripts/setup_cron.sql` to schedule it every 5 minutes
-6. test it: `bash scripts/test_monitor.sh YOUR_PROJECT_REF`
-
-That's it. From that point it runs itself.
+5. schedule it with `scripts/setup_cron.sql`
+6. test: `bash scripts/test_monitor.sh YOUR_PROJECT_REF`
 
 ---
 
-## picking an AI provider
+## AI provider setup
 
-All three are optional. If you set none, it uses templates and still works fine.
+All three providers are optional. Set none and it uses templates.
+Set your preferred provider via `AI_PRIMARY_PROVIDER`.
+Set your full fallback order via `AI_PROVIDER_PREFERENCE`.
 
-| provider | key secret | model used | notes |
-|----------|-----------|------------|-------|
-| Grok (xAI) | `GROK_API_KEY` | grok-3-mini | fastest, cheapest, good crypto context |
-| OpenAI | `OPENAI_API_KEY` | gpt-4o-mini | reliable, well-tested |
+| provider | key name | model | notes |
+|----------|----------|-------|-------|
+| Grok (xAI) | `GROK_API_KEY` | grok-3-mini | fast, good crypto context |
+| OpenAI | `OPENAI_API_KEY` | gpt-4o-mini | reliable, widely supported |
 | NVIDIA Nemotron | `NEMOTRON_API_KEY` | nemotron-ultra-253b | highest quality, slower |
 
-Priority order: Grok → OpenAI → Nemotron → template. Set whichever you have.
-If multiple keys are set, the highest-priority one wins. The active provider
-is logged in every post record so you can see what wrote what.
+See [docs/ai-providers.md](docs/ai-providers.md) for full setup and examples.
 
 ---
 
 ## data sources
 
-| source | what it provides | key required? |
-|--------|-----------------|---------------|
-| DEXScreener | price, volume, txn counts, liquidity | no |
-| Birdeye | token overview, holder count | yes — free tier works |
-| Solscan | top holder list, concentration | yes — free tier works |
-| X API | mentions, sentiment, engagement | yes — basic tier works |
-
-DEXScreener is the primary source. Everything else fills in the gaps.
+| source | provides | key required? |
+|--------|----------|---------------|
+| DEXScreener | price, volume, txns, liquidity, trending | no |
+| Birdeye | token overview, holder count | yes — free tier |
+| Solscan | top holder list, concentration | yes — free tier |
+| X API | mentions, sentiment | yes — basic tier |
 
 ---
 
@@ -75,13 +74,13 @@ DEXScreener is the primary source. Everything else fills in the gaps.
 
 | trigger | public channel | ops group |
 |---------|---------------|-----------|
-| daily update | post | detailed summary |
-| trending | post | — |
-| volume spike | post | — |
-| price up 10%+ | post | — |
-| holder milestone | post | — |
-| health warning | — | alert |
-| critical health | — | alert |
+| daily update | ✓ | ✓ (detailed) |
+| trending | ✓ | — |
+| volume spike | ✓ | — |
+| price up 10%+ | ✓ | — |
+| holder milestone | ✓ | — |
+| health warning | — | ✓ |
+| health critical | — | ✓ |
 
 ---
 
@@ -89,13 +88,13 @@ DEXScreener is the primary source. Everything else fills in the gaps.
 
 ```
 ├── supabase/
-│   ├── migrations/        database schema (run once)
+│   ├── migrations/         database schema (run once)
 │   └── functions/
-│       └── mim-monitor/   edge function (deploy via CLI or dashboard)
+│       └── mim-monitor/    edge function
 ├── scripts/
-│   ├── setup_cron.sql     schedules the monitor in pg_cron
-│   ├── test_monitor.sh    fires a single cycle manually
-│   └── x_poster.py        polls content_queue and posts tweets
+│   ├── setup_cron.sql      schedules the monitor
+│   ├── test_monitor.sh     manual test run
+│   └── x_poster.py         tweet queue runner
 └── docs/
     ├── setup.md
     ├── telegram.md
@@ -111,11 +110,11 @@ DEXScreener is the primary source. Everything else fills in the gaps.
 
 - [setup guide](docs/setup.md)
 - [telegram setup](docs/telegram.md)
-- [where to get api keys](docs/api-keys.md)
+- [api key sources](docs/api-keys.md)
 - [ai provider setup](docs/ai-providers.md)
 - [how it works](docs/architecture.md)
-- [extending it](docs/customization.md)
+- [customization](docs/customization.md)
 
 ---
 
-MIT license. Use it, fork it, break it, fix it.
+MIT license. Use it, fork it, modify it.
