@@ -10,10 +10,30 @@ and acting in coordination.
 
 - fetches recent transactions for the token mint from the Solana RPC
 - parses each transaction to extract wallet, side (buy/sell), token amount, SOL amount, and price
+- derives SOL amount via WSOL account delta (works for Jupiter, Raydium CLMM, Orca, Meteora) with native SOL fallback for Raydium AMM v4
 - detects relationships between wallets acting in the same slot or within a configurable time window
-- identifies bundles: coordinated buys, coordinated sells, wash trades
-- builds and updates a profile for every wallet seen
+- gates relationships behind a co-occurrence staging table (MIN_CO_OCCURRENCE = 2) to suppress false positives
+- identifies bundles: coordinated buys, coordinated sells, wash trades — deduplicated by SHA-256 hash
+- builds and updates a profile for every wallet seen using atomic Postgres increments (lifetime-safe)
+- uses advisory locks to prevent concurrent run corruption
 - stores everything in Postgres (trades, wallet_profiles, wallet_relationships, bundles)
+
+---
+
+## setup order (important)
+
+1. Run migration `20260608000000_create_monitoring_schema.sql`
+2. Run migration `20260608000001_create_wallet_tracking_schema.sql`
+3. Run migration `20260608000002_wallet_tracking_fixes.sql` ← **required before deploying v2 function**
+4. Deploy edge function: `supabase functions deploy wallet-tracker --no-verify-jwt`
+5. Add secrets:
+   ```
+   TOKEN_MINT         your token's mint address
+   SOLANA_RPC_URL     your paid RPC endpoint (Helius/QuickNode/Triton — see note below)
+   ```
+6. Set up cron (see scripts/setup_cron.sql)
+
+> **RPC note:** The function will work with the public RPC but will drop trades under load due to rate limiting. For any real-volume token, use a paid RPC. Helius free tier (100k req/day) is sufficient for most tokens.
 
 ---
 
@@ -21,10 +41,12 @@ and acting in coordination.
 
 | table | contains |
 |-------|----------|
-| `trades` | every individual buy/sell tx with wallet, amount, price, program |
-| `wallet_profiles` | aggregated stats per wallet: total buys/sells, PnL, bundle score, tags |
-| `wallet_relationships` | pairs of wallets flagged as related, with type and confidence |
-| `bundles` | groups of wallets acting together in a slot or time window |
+| `trades` | every individual buy/sell tx: wallet, amount, price, program, sol derivation method |
+| `wallet_profiles` | lifetime aggregated stats: buys/sells, SOL volume, PnL, bundle score, tags (`data_quality` flag indicates pre/post fix) |
+| `wallet_relationships` | confirmed relationship pairs (co_occurrence ≥ 2), with type and confidence |
+| `relationship_staging` | first-seen relationships awaiting second confirmation (TTL: 1 hour) |
+| `bundles` | deduplicated groups of wallets acting together (unique by SHA-256 hash) |
+| `token_meta` | token launch time and metadata (used for sniper detection) |
 
 ---
 
@@ -56,72 +78,43 @@ and acting in coordination.
 | tag | assigned when |
 |-----|---------------|
 | `bundler` | bundle score ≥ 60 |
-| `sniper` | bought within 5 minutes of first appearance in the tracker |
+| `sniper` | first buy within 5 minutes of token launch time (from `token_meta`) |
 | `whale` | moved more than 50 SOL total |
 | `bot` | more than 20 trades observed |
 | `flipper` | roughly equal buys and sells |
 
 ---
 
-## setup
-
-Add one secret to Supabase:
-
-```
-SOLANA_RPC_URL    your RPC endpoint (default: mainnet-beta public)
-```
-
-For production use a paid RPC like Helius, QuickNode, or Triton:
-```
-https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
-```
-The free public RPC rate-limits aggressively on `getTransaction`.
-
-Deploy the function:
-```bash
-supabase functions deploy wallet-tracker --no-verify-jwt
-```
-
-Then run the migration:
-```bash
-# paste supabase/migrations/20260608000001_create_wallet_tracking_schema.sql
-# into the SQL Editor
-```
-
----
-
 ## historical scan
 
-To scan the entire trading history and build a complete picture of
-coin movement from launch:
+To scan the entire trading history from launch:
 
 ```bash
 export SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 bash scripts/historical_scan.sh YOUR_PROJECT_REF
 ```
 
-This walks backwards through all transactions, page by page (100 per page),
-untilit reaches the first ever trade. It writes every trade and relationship
-it finds to the database as it goes, so it is safe to stop and resume.
+The scan saves its cursor to `.scan_state` after every page.
+If it crashes or is interrupted, just re-run the same command — it resumes automatically.
+To force a fresh scan from the beginning: `rm .scan_state`
 
-To resume from where it stopped, pass the oldest signature from the last run:
-```bash
-bash scripts/historical_scan.sh YOUR_PROJECT_REF OLDEST_SIGNATURE
-```
+**RPC rate limits:** On the public RPC, the scan will slow dramatically due to 429s and backoff.
+For a token with >50k transactions, use a paid RPC.
 
 ---
 
 ## querying the data
 
-Top buyers by volume:
+**Top buyers by lifetime volume:**
 ```sql
-select wallet, total_buys, total_buy_sol, bundle_score, tags
+select wallet, total_buys, total_buy_sol, bundle_score, tags, data_quality
 from wallet_profiles
+where data_quality = 'verified'   -- exclude pre-fix rows if any remain
 order by total_buy_sol desc
 limit 20;
 ```
 
-All flagged bundlers:
+**All confirmed bundlers:**
 ```sql
 select wallet, bundle_score, tags, total_buy_sol
 from wallet_profiles
@@ -129,7 +122,7 @@ where bundle_score >= 60
 order by bundle_score desc;
 ```
 
-Wallets buying and selling at the same time:
+**Wallets buying and selling at the same time:**
 ```sql
 select wallet_a, wallet_b, relationship_type, co_occurrence, confidence
 from wallet_relationships
@@ -137,17 +130,24 @@ where relationship_type in ('same_slot_buy','same_slot_sell','wash_trade')
 order by confidence desc;
 ```
 
-All detected bundles:
+**All detected bundles:**
 ```sql
-select bundle_type, wallets, total_sol, confidence, notes
+select bundle_type, wallets, total_sol, confidence, notes, detected_at
 from bundles
 order by detected_at desc;
 ```
 
-Full trade history for a wallet:
+**Full trade history for a wallet:**
 ```sql
 select signature, block_time, side, token_amount, sol_amount, price_per_token, program
 from trades
 where wallet = 'WALLET_ADDRESS'
 order by block_time desc;
+```
+
+**Wallets with suspicious data (pre-fix baseline — rebuild recommended):**
+```sql
+select wallet, total_buy_sol, data_quality
+from wallet_profiles
+where data_quality = 'pre_fix';
 ```
